@@ -167,44 +167,98 @@ Current runtime score on NP05J: **27 PASS / 0 FAIL / 1 SKIP** (S22 skips when th
 
 NP05J / Android 15 / kernel 6.6.56. µs per operation, mean.
 
-### Memory read
+Two build configurations exercised on the same device back-to-back — `HIDE_*=0` (bench baseline, all concealment kprobes off) and `HIDE_SELF_MODULE=1 HIDE_VMAP=1 HIDE_TASK=1 HIDE_KGSL_STRENGTH=0` (main-repo defaults). All numbers cross-process against a `mini-game` producer that writes an encrypted position bundle at ~3 kiter/ms into an isolated 4-KiB anon page; the memory bench reads/writes a separate 4-KiB scratch page so the target's state stays intact.
 
-| Size | Driver | `process_vm_readv` | `/proc/pid/mem` |
-| --- | ---: | ---: | ---: |
-| 4 B | 0.699 | 1.162 | 1.518 |
-| 1 KiB | 0.809 | 1.298 | 1.615 |
-| 64 KiB | 12.293 | 15.762 | 23.481 |
-| 1 MiB | 188.905 | 225.284 | 362.884 |
-| 4 MiB | 796.633 | 815.044 | 1470.967 |
+Autonomous test binary result: **28 PASS / 0 FAIL / 1 SKIP** (S22_stale_mm SKIPs when the child's synthetic VA does not map; the code path is covered under review) on the default-hide build. The no-hide build gives 24/4/1 with the four expected FAILs on the concealment-checking scenarios (`S2_proc_modules_hidden`, `S2_sys_module_hidden`, `S12_file_hide`, `S13_pid_hide`) — proof that those tests actually flip when the gate is off.
 
-### Memory write
+### Memory read (cross-process, ioctl round-trip, µs)
 
-| Size | Driver | `process_vm_writev` |
+| Size | p50 no-hide | p50 default-hide | p95 default | p99 default | mean default |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4 B | 1.04 | 1.04 | 1.09 | 1.15 | 1.08 |
+| 64 B | 1.04 | 1.04 | 1.09 | 1.15 | 1.05 |
+| 256 B | 1.09 | 1.09 | 1.09 | 1.20 | 1.08 |
+| 1 KiB | 1.15 | 1.20 | 1.25 | 1.30 | 1.36 |
+| 4 KiB | 1.56 | 1.51 | 1.67 | 1.72 | 1.63 |
+
+### Memory write (cross-process, µs)
+
+| Size | p50 no-hide | p50 default-hide | p95 default | p99 default | mean default |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4 B | 1.04 | 1.04 | 1.09 | 1.09 | 1.05 |
+| 64 B | 1.25 | 1.09 | 1.77 | 1.88 | 1.16 |
+| 256 B | 1.09 | 1.41 | 1.88 | 1.98 | 1.55 |
+| 1 KiB | 1.15 | 1.15 | 1.46 | 1.56 | 1.22 |
+| 4 KiB | 1.46 | 1.41 | 1.51 | 1.56 | 1.44 |
+
+### MULTI_READ scaling (µs / batch)
+
+| Entries | p50 no-hide | p50 default-hide | p95 default | mean default |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 3.44 | 2.81 | 6.98 | 4.57 |
+| 128 | 15.47 | 15.47 | 26.72 | 17.72 |
+| 512 | 55.78 | 55.73 | 71.30 | 57.94 |
+| 1024 | 109.89 | 109.58 | 139.48 | 247.28 |
+
+### PTE hook install/remove cycle (µs)
+
+| Metric | no-hide | default-hide |
 | --- | ---: | ---: |
-| 4 B | 0.710 | 1.166 |
-| 4 KiB | 1.047 | 1.521 |
-| 64 KiB | 12.651 | 15.875 |
-| 1 MiB | 191.251 | 227.859 |
+| p50 | 9.38 | 9.32 |
+| p95 | 9.69 | 9.58 |
+| p99 | 34.22 | 9.84 |
+| mean | 10.19 | 9.49 |
 
-### MULTI_READ
+### HWBP per-call overhead — in-process microbench (`S11`, ns)
 
-| Entries | N × READ | MULTI_READ | Speedup |
-| ---: | ---: | ---: | ---: |
-| 8 | 5.913 | 1.819 | 3.25× |
-| 128 | 92.547 | 12.573 | 7.36× |
-| 512 | 373.199 | 46.071 | 8.10× |
+Same-thread mini-loop writing to a 1-CPU-local address 200 000 times per configuration:
 
-### Hook ioctl latency
-
-| Operation | p50 | p95 | p99 |
+| Configuration | ns/call no-hide | ns/call default-hide | slowdown vs base |
 | --- | ---: | ---: | ---: |
-| PTE install/update | 4.063 | 4.219 | 5.156 |
-| HWBP install | 9.688 | 13.438 | 2448.438 |
-| HWBP SET_OVERRIDE | 0.834 | 0.938 | 0.938 |
+| baseline (no HWBP) | 3.4 | 3.6 | 1.00× |
+| HWBP write, ring + signal delivery | 1050.7 | 1039.3 | ≈290–305× |
+| HWBP write, `DRV_HWBP_FLAG_TIMING_BYPASS` | 601.6 | 601.8 | ≈165–175× |
+
+`TIMING_BYPASS` skips the per-hit ring push and NOTIFY delivery; register-override effects still apply. Cost drops ~43 % vs the plain path — pick it when the client only needs side effects (overrides) and does not read hits.
+
+### HWBP hit-rate under sustained load (6 s window, mini-game @ ~3 kHz effective)
+
+Long-run cross-process W watchpoint on a target thread. `hits/s` is what the ring delivers to the client; `game_it_ms` is the mini-game's own reported iteration rate (kernel-side trap overhead pulls it down):
+
+| Mode | game_it_ms no-hide | game_it_ms default-hide | notes |
+| --- | ---: | ---: | --- |
+| baseline (no hook) | 3.0 | 2.0 | reference |
+| plain ring only | 3.0 | 2.0 | ring push + no signal |
+| `TIMING_BYPASS` | 3.0 | 2.0 | no ring, no signal; overrides only |
+| `CAPTURE_FP` | 3.0 | 2.0 | Q0..Q31 filled in every hit |
+| `SET_SAMPLE(10)` | 2.2 | 3.6 | every 10th hit fires |
+| `SET_SAMPLE(100)` | 2.0 | 4.0 | every 100th hit fires |
+| `TIMING_BYPASS + SAMPLE(100)` | 2.3 | 3.3 | cheapest gated mode |
 
 ### HWBP CAPS on device
 
-`num_brps=6`, `num_wrps=4`, `ring_slots=32`, `max_overrides=10`, `hit_bytes=800`, `install_req_bytes=192`, `fp_ready=1`. `flags_supported low = 0xE` (NOTIFY | CAPTURE_FP | TIMING_BYPASS), `abi_generation = 2`.
+`num_brps=6`, `num_wrps=4`, `ring_slots=32`, `max_overrides=10`, `hit_bytes=800`, `install_req_bytes=192`, `fp_ready=1`. `flags_supported low = 0xE` (NOTIFY | CAPTURE_FP | TIMING_BYPASS), `abi_generation = 2`. CAPS struct locked at 32 bytes; any future extension travels in the packed high 8 bits of `flags_supported` so an older client's caller-side stack buffer never overflows.
+
+### CPU load, freq, thermal
+
+Bench thread stays on little/mid cores throughout the sweep; `cpu7` (big) idles at its minimum 1017 MHz. Package skin temperature (`thermal_zone58` = `skin-msm-therm`) reads 23–27 °C at rest and does not move across the 90-second bench — the driver's memory / PTE / HWBP paths are not thermally interesting. `cpu%` column in the summary reflects only the bench thread's slice of the 8-core total, running 20 000–5 000 tight ioctl iterations per row.
+
+### Combat-mode function verification (default-hide build)
+
+| Function | Test method | Result |
+| --- | --- | --- |
+| `driver.open()` (reboot handshake) | `my-driver-combat verify-open` | fd_open=1 hwbpAvailable=1 |
+| Concealment | S2 in `my-driver-test` | `/proc/modules`, `/sys/module`, `/proc/vmallocinfo` all hidden |
+| `memory.read/write` | Phase A verify + S4/S17 | pattern round-trip 0xDEADBEEF01020304 matches; watchpoint fires |
+| `memory.multiRead(4)` | Phase A verify | 4 values returned |
+| `pteHook.install/remove` | Phase A verify + S20 | install=1 remove=1; PTE_HOOK_INSTALL reaches handler |
+| HWBP install matrix | S4 (X/R/W/RW + reject cases) | 6/6 |
+| HWBP gates | S5..S10 | bypass_pid, sample, condition, notify, capture_fp, translate_bait all pass |
+| `touch.down/move/up` | `combat touch-tap 0 540 960` | driver API returns 1/1/1 (getevent capture depends on device event pinning, not tested via getevent here) |
+| `gyro.bindAuto` + `gyro.write` | `combat gyro-bind` + `combat gyro-write 0.1 -0.05 1` | armed=1, write ok=1 (uprobe on libsensorservice found) |
+| `hideName.add/remove` | Create marker → `combat hide-name` → `ls | grep marker` | 1 → 0 → 1 (want 1/0/1) |
+| `hidePid.add/remove` | `sleep 30 &` → `combat hide-pid $CHILD` → `ls /proc` + `ps -A` | ls: 1 → 0 → 1; `ps -A` count: 0 (want 0) |
+| `hideKgsl()` | `combat hide-kgsl $pid` | returns EOPNOTSUPP under `HIDE_KGSL_STRENGTH=0` (expected — arm STRENGTH≥1 to enable) |
 
 ## Layout
 
@@ -228,7 +282,9 @@ diagnostics/capture-kmsg.sh   on-device kmsg capture (root)
 .github/workflows/build.yml   seven-KMI kernel + userspace CI
 ```
 
-## Configurable knobs
+## Build knobs
+
+Every gate is passed on the `make` command line and mirrored into a `KCFG_*` preprocessor define at compile time — see `driver/Kbuild`. Defaults match a production stealth profile with no GPU concealment:
 
 ```bash
 make DRIVER_NAME=my-driver \
@@ -236,7 +292,35 @@ make DRIVER_NAME=my-driver \
      HIDE_SELF_MODULE=1 HIDE_VMAP=1 HIDE_TASK=1 HIDE_KGSL_STRENGTH=0
 ```
 
-`DRIVER_NAME` controls the module filename. `TARGET_PKG` selects the harvest package string. `REBOOT_MAGIC` controls the handshake magic pair. `KCFG_DECOY_NAME` sets the module rename target.
+### Concealment gates
+
+| Variable | Default | Values | Kernel effect | Compile-time |
+| --- | :---: | :---: | --- | :---: |
+| `HIDE_SELF_MODULE` | `1` | 0 / 1 | Renames the module to `KCFG_DECOY_NAME` (default `iptable_filter`), unlinks it from the kernel module list + sysfs kobject, and arms the `m_show` / `s_show` kprobe (`module_hide.o`) so any `/proc/modules` or `/sys/module/` iterator skips the row even if it is somehow reinstated. Off = live symbol table entry visible. | `KCFG_HIDE_SELF_MODULE` |
+| `HIDE_VMAP` | `1` | 0 / 1 | Unlinks the driver's `vmap_area` from `vmap_area_list` (and the pre-6.9 `vmap_area_root` rbtree) so `/proc/vmallocinfo` cannot report the module's mapping. Off = mapping visible in that file. | `KCFG_HIDE_VMAP` |
+| `HIDE_TASK` | `1` | 0 / 1 | Compiles `dirent_hide.o` and arms one `filldir64` kprobe that services two hide sets: up to `DIRENT_HIDE_MAX_PIDS = 8` numeric `/proc/<pid>` entries and `DIRENT_HIDE_NAME_SLOTS = 16` × 63-char exact basenames. Off = `DRV_CMD_HIDE_PID_*` / `DRV_CMD_HIDE_NAME_*` return `-EOPNOTSUPP` and the kprobe is not registered. | `KCFG_HIDE_TASK` |
+| `HIDE_KGSL_STRENGTH` | `0` | 0 / 1 / 2 / 3 | GPU-process concealment against Qualcomm Adreno KGSL enumeration. `0` = off (`DRV_CMD_HIDE_KGSL` → `-EOPNOTSUPP`). `1` = retroactive — walks both `kgsl_process_private` rbtrees on `kgsl_driver` and `rb_erase`s the entry whose PID string matches. `2` = proactive only — three kprobes (`kgsl_process_init_sysfs`, `kgsl_process_init_debugfs`, `sysfs_create_group` gated on a `"kgsl"` ancestor in the kobject parent chain) spoof `-ENOMEM` before the target's row is even created. `3` = both layers. Kbuild refuses to build `STRENGTH ≥ 2` with `HIDE_TASK = 0` because the proactive layer reads the shared hidden-PID list from `dirent_hide.c`. | `KCFG_HIDE_KGSL_STRENGTH` |
+
+### Identity / handshake
+
+| Variable | Default | Kernel effect | Compile-time |
+| --- | :---: | --- | :---: |
+| `DRIVER_NAME` | `my-driver` | Sets the `.ko` filename, `THIS_MODULE->name` before concealment renames it, and the string reported to CI artefact naming. | `KCFG_DRIVER_NAME` |
+| `TARGET_PKG` | `"cent.tmgp.sgame"` | Package name the harvest subsystem locks onto — must be a C string literal, so double-quotes have to survive the shell (`TARGET_PKG='"pkg.name"'`). | `KCFG_TARGET_PACKAGE` |
+| `ANON_INODE_NAME` | `"[driver]"` | Label passed to `anon_inode_getfile` — appears in `/proc/<pid>/fdinfo` as `anon_inode:<name>`. | `KCFG_ANON_INODE_NAME` |
+| `REBOOT_MAGIC` | `0x123456u` | Sentinel matched in `regs[0]`/`regs[1]` of the wrapped `pt_regs` inside `reboot()` handshake. Same value must be mirrored in the client (`DRIVER_REBOOT_MAGIC1/2` in `uapi.h`). | `KCFG_REBOOT_MAGIC` |
+
+### Optional feature gates (off by default; pass on the `make` line)
+
+| Preprocessor define | Effect |
+| --- | --- |
+| `-DKCFG_BUILD_NO_CFI` | Patches CFI helper thunks with `RET` — global, invasive; last-resort escape hatch for kernels where CFI mismatches would otherwise panic on a hook. |
+| `-DKCFG_BUILD_PTE_MAPPING` | Enables the legacy PTE-walk write-RO path in `memory.c` for kernels where `aarch64_insn_patch_text_nosync` is stripped. |
+| `-DKCFG_BUILD_HIDE_SIGNAL` | Enables the signal-bypass hook (blocks a listed signal on the target thread). |
+
+### CI overrides
+
+`.github/workflows/build.yml` accepts `hide_self_module`, `hide_vmap`, `hide_task`, `hide_kgsl_strength`, and `ddk_release` as `workflow_dispatch` inputs, each empty = keep default. The gate-check step reads them back out of `*.cmd` files and asserts that `src/dirent_hide.o`, `src/stealth.o`, `src/module_hide.o` exist iff the respective gate is on.
 
 ## Caveats
 
