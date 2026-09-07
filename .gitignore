@@ -76,11 +76,6 @@ __pycache__/
 .env
 .env.local
 *.local
-.claude/local/
-.codex/local/
-
-# Local-only test tools.
-/scripts/
 
 # --- On-device diagnostics (kmsg captures, dmesg dumps) --------------------
 diagnostics/*.log

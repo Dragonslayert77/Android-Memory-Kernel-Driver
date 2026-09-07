@@ -21,10 +21,10 @@ ifeq ($(filter 0 1 2 3,$(HIDE_KGSL_STRENGTH)),)
 $(error HIDE_KGSL_STRENGTH must be 0, 1, 2, or 3)
 endif
 
-# Proactive KGSL kprobes (STRENGTH >= 2) read the shared hidden-PID list from hide_task.c.
+# Proactive KGSL kprobes (STRENGTH >= 2) read the shared hidden-PID list from dirent_hide.c.
 ifneq ($(filter 2 3,$(HIDE_KGSL_STRENGTH)),)
 ifeq ($(HIDE_TASK),0)
-$(error HIDE_KGSL_STRENGTH >= 2 requires HIDE_TASK=1 (proactive KGSL hooks read hide_task's hidden-PID list))
+$(error HIDE_KGSL_STRENGTH >= 2 requires HIDE_TASK=1 (proactive KGSL hooks read dirent_hide's hidden-PID list))
 endif
 endif
 
@@ -46,11 +46,16 @@ $(DRIVER_NAME)-objs := \
 	src/user_hook.o
 
 ifneq ($(HIDE_TASK),0)
-$(DRIVER_NAME)-objs += src/hide_task.o
+$(DRIVER_NAME)-objs += src/dirent_hide.o
 endif
 
 ifneq ($(HIDE_KGSL_STRENGTH),0)
 $(DRIVER_NAME)-objs += src/stealth.o
+endif
+
+# C.1 /proc/modules scrub: only meaningful when we already unlink ourselves.
+ifneq ($(HIDE_SELF_MODULE),0)
+$(DRIVER_NAME)-objs += src/module_hide.o
 endif
 
 # -I: public headers + intra-subsystem private headers.
@@ -67,7 +72,7 @@ ccflags-y += -Wno-unused-variable
 # KCFG_REBOOT_MAGIC — sentinel the reboot() handshake matches in regs[0]/regs[1] (inner wrapped pt_regs). Same value exported to userspace as DRIVER_REBOOT_MAGIC1/2 in uapi.h.
 # KCFG_HIDE_SELF_MODULE — unlink LKM from /proc/modules + /sys/module/<name>.
 # KCFG_HIDE_VMAP — unlink LKM vmap area from /proc/vmallocinfo.
-# KCFG_HIDE_TASK — install filldir64 kprobe to hide PIDs from /proc readdir; up to HIDE_TASK_MAX_SLOTS.
+# KCFG_HIDE_TASK — arm the filldir64 kprobe that hides PIDs (up to DIRENT_HIDE_MAX_PIDS) and dir entry names.
 # KCFG_HIDE_KGSL_STRENGTH — 0=off, 1=retroactive rb_erase, 2=proactive kprobes only, 3=both.
 TARGET_PKG ?= "cent.tmgp.sgame"
 ANON_INODE_NAME ?= "[driver]"

@@ -81,11 +81,17 @@ public:
     class Hwbp {
     public:
         Hwbp(Driver& d) : m_d(d) {}
-        bool install(uint64_t addr, const std::vector<drv_hwbp_reg_override>& overrides, bool passThrough = false, uint32_t bpType = DRV_HWBP_TYPE_EXECUTE, uint32_t bpLen = DRV_HWBP_LEN_EXECUTE);
+        bool install(uint64_t addr, const std::vector<drv_hwbp_reg_override>& overrides, bool passThrough = false, uint32_t bpType = DRV_HWBP_TYPE_EXECUTE, uint32_t bpLen = DRV_HWBP_LEN_EXECUTE, uint32_t flags = 0);
         bool setOverride(uint64_t addr, const std::vector<drv_hwbp_reg_override>& overrides);
         bool remove(uint64_t addr);
         bool clearAll();
         std::vector<drv_hwbp_hit> getHits(uint64_t addr, size_t maxHits = DRV_HWBP_HIT_RING_SLOTS);
+        std::optional<drv_hwbp_caps> caps();
+        bool setSample(uint64_t addr, uint32_t every);
+        bool setCondition(uint64_t addr, uint32_t reg, uint32_t op, uint64_t value);
+        bool setBypassPid(uint64_t addr, int32_t bypassPid);
+        bool setNotify(uint64_t addr, int32_t notifyPid, uint32_t signalNo = 0);
+        std::optional<uint64_t> translateBait(uint64_t addr);
     private:
         Driver& m_d;
     };
@@ -113,6 +119,17 @@ public:
         Driver& m_d;
     };
 
+    // Basename hider — 16 slots, ≤63 chars. Shares kprobe with HidePid.
+    class HideName {
+    public:
+        HideName(Driver& d) : m_d(d) {}
+        bool add(const std::string& name);
+        bool remove(const std::string& name);
+        bool clear();
+    private:
+        Driver& m_d;
+    };
+
     Driver();
     ~Driver();
     Driver(const Driver&) = delete;
@@ -121,6 +138,8 @@ public:
     bool open();
     void close();
     bool isOpen() const { return m_fd >= 0; }
+    // True iff kernel exposes HWBP and ABI sizes match this build.
+    bool hwbpAvailable() const { return m_hwbpAvailable; }
     void setTarget(pid_t pid) { m_targetPid = pid; }
     pid_t target() const { return m_targetPid; }
 
@@ -137,6 +156,10 @@ public:
     Hwbp hwbp;
     PteHook pteHook;
     HidePid hidePid;
+    HideName hideName;
+
+    // Escape hatch for tests + untyped ioctls; true iff ioctl returned >= 0.
+    bool rawIoctl(unsigned int cmd, void* arg) { return doIoctlRaw(cmd, arg) >= 0; }
 
 private:
     int doIoctl(unsigned int cmd, drv_ioctl_req* req);
@@ -144,13 +167,20 @@ private:
 
     int m_fd = -1;
     pid_t m_targetPid = 0;
+    bool m_hwbpAvailable = false;
 };
 
 extern Driver driver;
 
 static_assert(sizeof(drv_hwbp_reg_override) == 16);
 static_assert(sizeof(drv_hwbp_install_req) == 192);
-static_assert(sizeof(drv_hwbp_hit) == 280);
+static_assert(sizeof(drv_hwbp_hit) == 800);
+static_assert(sizeof(drv_hwbp_caps) == 32);
+static_assert(sizeof(drv_hwbp_sample_req) == 24);
+static_assert(sizeof(drv_hwbp_condition_req) == 32);
+static_assert(sizeof(drv_hwbp_bypass_req) == 24);
+static_assert(sizeof(drv_hwbp_notify_req) == 24);
+static_assert(sizeof(drv_hwbp_bait_req) == 24);
 static_assert(sizeof(drv_pte_hook_install_req) == 40);
 
 template<typename T>

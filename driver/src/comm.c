@@ -8,9 +8,11 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/gfp.h>
+#include <linux/jiffies.h>
 #include <linux/kprobes.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/spinlock.h>
 #include <linux/printk.h>
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
@@ -35,7 +37,7 @@
 
 #include "comm.h"
 #include "harvest.h"
-#include "hide_task.h"
+#include "dirent_hide.h"
 #include "hook_engine.h"
 #include "hwbp.h"
 #include "input_synth.h"
@@ -67,10 +69,7 @@ static int drv_task_work_add(struct task_struct *task, struct callback_head *wor
 	return drv_call_task_work_add(task_work_add_ptr, task, work, notify);
 }
 
-/* Pre-resolve task_work_add at module init from process context. Without this
-   the first magic reboot/prctl handshake hits the lazy kallsym_lookup branch
-   from inside the kprobe pre-handler — register_kprobe there sleeps in atomic
-   context (mutex_lock(&kprobe_mutex) + stop_machine). */
+/* Pre-resolve task_work_add at init; the kprobe pre-handler can't call kallsym_lookup from atomic context. */
 int comm_warm_symbols(void) {
 	if (!task_work_add_ptr) {
 		task_work_add_ptr = (task_work_add_fn_t)kallsym_lookup("task_work_add");
@@ -83,8 +82,7 @@ int comm_warm_symbols(void) {
 }
 
 static int drv_close_fd(unsigned int fd) {
-	/* close_fd(unsigned) appeared in 5.11 (commit 8760c909f54e); pre-5.11
-	 * vendor forks still expose __close_fd(struct files_struct *, unsigned). */
+	/* close_fd(unsigned) since 5.11; pre-5.11 uses __close_fd(files, fd). */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
 	return close_fd(fd);
 #else
@@ -92,11 +90,19 @@ static int drv_close_fd(unsigned int fd) {
 #endif
 }
 
+/* fd-scoped HWBP cleanup: fd close reclaims only its own trackers. */
+static int inofile_release(struct inode *inode, struct file *filp) {
+	(void)inode;
+	hwbp_clear_by_file(filp);
+	return 0;
+}
+
 /* .owner=THIS_MODULE pins module text for as long as any client holds the fd. */
 const struct file_operations inofile_fops = {
 	.owner = THIS_MODULE,
 	.unlocked_ioctl = dispatch_ioctl_unlocked,
 	.compat_ioctl = dispatch_ioctl_unlocked,
+	.release = inofile_release,
 };
 
 struct kprobe reboot_kp = {
@@ -114,9 +120,7 @@ static bool drv_read_wrapped_syscall_args(struct pt_regs *regs, unsigned long ar
 	if (!pt_regs_ptr)
 		return false;
 
-	/* copy_from_kernel_nofault is the canonical safe kernel-VA reader since
-	 * 5.8 (commit fe557319aa06). Driver matrix floor is 5.10, so this is
-	 * always available — no compat shim needed. */
+	/* copy_from_kernel_nofault is available since 5.8; matrix floor is 5.10. */
 	return copy_from_kernel_nofault(args, (const void *)(uintptr_t)pt_regs_ptr, sizeof(unsigned long) * 4) == 0;
 }
 
@@ -145,11 +149,18 @@ static void drv_queue_fd_install(void __user *reply, const char *source) {
 	}
 }
 
+/* Drop duplicate handshake hits from arm64 syscall wrappers within 4 jiffies. */
 int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs) {
+	static DEFINE_SPINLOCK(handshake_dedup_lock);
+	static pid_t last_pid;
+	static unsigned long last_reply;
+	static unsigned long last_jiffies;
+
 	unsigned long args[4];
+	unsigned long flags;
+	bool duplicate;
 
 	(void)p;
-
 	if (!regs)
 		return 0;
 
@@ -163,12 +174,21 @@ int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs) {
 			return 0;
 		if ((u32)args[0] != COMM_REBOOT_MAGIC1 || (u32)args[1] != COMM_REBOOT_MAGIC2)
 			return 0;
-		drv_queue_fd_install((void __user *)args[3], "reboot/ptregs");
-		return 0;
 	}
 
-	drv_queue_fd_install((void __user *)args[3], "reboot");
+	spin_lock_irqsave(&handshake_dedup_lock, flags);
+	duplicate = (last_pid == current->pid && last_reply == args[3] && time_before_eq(jiffies, last_jiffies + 4));
+	if (!duplicate) {
+		last_pid = current->pid;
+		last_reply = args[3];
+		last_jiffies = jiffies;
+	}
+	spin_unlock_irqrestore(&handshake_dedup_lock, flags);
 
+	if (duplicate)
+		return 0;
+
+	drv_queue_fd_install((void __user *)args[3], "reboot");
 	return 0;
 }
 
@@ -269,13 +289,7 @@ static long do_memory_cmd(unsigned int cmd, void __user *arg) {
 		return 0;
 
 	switch (cmd) {
-		/* {read,write}_process_memory_{linear,vmap} already handle the user-side
-		   buffer themselves via copy_to_user/copy_from_user under the target's
-		   mmap_read_lock. The original .ko hands req.buf straight through; an
-		   earlier reconstruction tried to add a kvmalloc kernel-bounce buffer but
-		   never adjusted the inner functions' drv_user_ptr_in_range() guard,
-		   which rejects every kernel pointer and silently returns -EFAULT —
-		   making req.size==0 surface as Read16/ElfMagic failures on the client. */
+		/* Pass req.buf straight through; the inner readers do their own copy_to_user. */
 		case DRV_CMD_READ_MEM_LINEAR:
 			if (req.size == 0 || req.size > DRV_MEM_CMD_MAX_SIZE)
 				break;
@@ -382,9 +396,7 @@ static long do_memory_cmd(unsigned int cmd, void __user *arg) {
 		resolve_target_mm((pid_t)req.pid, &task, &mm);
 		if (mm) {
 			rc = multi_read_process_memory(mm, (void __user *)(uintptr_t)req.buf, (unsigned int)req.extra);
-			/* multi_read_process_memory returns 1 on success and a
-			 * negative errno on failure; map both to the writeback
-			 * convention (req.size = 1 on success, 0 on failure). */
+			/* Map inner rc (1/-errno) to writeback convention (req.size=1/0). */
 			result = (rc > 0) ? 1 : 0;
 		}
 		break;
@@ -539,11 +551,16 @@ static long do_input_cmd(unsigned int cmd, void __user *arg) {
 	}
 }
 
+/* Router checks HWBP first; break the build if any command range overlaps. */
+_Static_assert(DRV_CMD_HWBP_RANGE_LAST < DRV_CMD_PTE_HOOK_RANGE_FIRST, "HWBP primary range overlaps PTE_HOOK range");
+_Static_assert(DRV_CMD_PTE_HOOK_RANGE_LAST < DRV_CMD_HWBP_EXT_RANGE_FIRST, "PTE_HOOK range overlaps HWBP extended range");
+_Static_assert(DRV_CMD_HWBP_INSTALL != DRV_CMD_PTE_HOOK_INSTALL && DRV_CMD_HWBP_GET_HITS != DRV_CMD_PTE_HOOK_INSTALL, "HWBP command collides with PTE_HOOK_INSTALL");
+
 static long dispatch_ioctl_unlocked(struct file *filp, unsigned int cmd, unsigned long arg) {
 	void __user *uarg = (void __user *)arg;
 	u64 hello;
 
-	(void)filp;
+	/* filp is forwarded to do_hwbp_cmd for fd-scoped tracker ownership. */
 
 	if (cmd == DRIVER_IOCTL_PING)
 		return 0;
@@ -571,13 +588,16 @@ static long dispatch_ioctl_unlocked(struct file *filp, unsigned int cmd, unsigne
 		return do_input_cmd(cmd, uarg);
 
 	if (cmd >= DRV_CMD_HWBP_RANGE_FIRST && cmd <= DRV_CMD_HWBP_RANGE_LAST)
-		return do_hwbp_cmd(cmd, uarg);
+		return do_hwbp_cmd(cmd, uarg, filp);
+
+	if (cmd >= DRV_CMD_HWBP_EXT_RANGE_FIRST && cmd <= DRV_CMD_HWBP_EXT_RANGE_LAST)
+		return do_hwbp_ext_cmd(cmd, uarg, filp);
 
 	if (cmd >= DRV_CMD_PTE_HOOK_RANGE_FIRST && cmd <= DRV_CMD_PTE_HOOK_RANGE_LAST)
 		return do_pte_hook_cmd(cmd, uarg);
 
 	if (cmd >= DRV_CMD_HIDE_PID_RANGE_FIRST && cmd <= DRV_CMD_HIDE_PID_RANGE_LAST)
-		return do_hide_task_cmd(cmd, uarg);
+		return do_dirent_hide_cmd(cmd, uarg);
 
 	/* DEVIATION: binary's outer guard is `cmd-11 <= 0x58` so cmds in [0x16, 0x63] also copy_from_user 0x28 bytes then return 0 via the jump-table default. We return -ENOTTY for any cmd not matching a known range — a documented behavioural delta. */
 	return -ENOTTY;

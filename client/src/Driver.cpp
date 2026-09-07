@@ -11,23 +11,46 @@
 
 Driver driver;
 
-Driver::Driver() : memory(*this), touch(*this), gyro(*this), hwbp(*this), pteHook(*this), hidePid(*this) {}
+Driver::Driver() : memory(*this), touch(*this), gyro(*this), hwbp(*this), pteHook(*this), hidePid(*this), hideName(*this) {}
 
 Driver::~Driver() {
     close();
 }
 
-// The reboot kprobe recognizes the magic pair and returns a new anonymous-inode fd through the fourth syscall argument.
+// Handshake + CAPS negotiation; caps EOPNOTSUPP keeps fd open with hwbpAvailable()==false, size/gen mismatch fails EPROTO.
 bool Driver::open() {
     if (m_fd >= 0) return true;
     int newFd = -1;
     ::syscall(SYS_reboot, DRIVER_REBOOT_MAGIC1, DRIVER_REBOOT_MAGIC2, 0L, &newFd);
-    if (newFd >= 0) { m_fd = newFd; return true; }
-    return false;
+    if (newFd < 0) return false;
+    m_fd = newFd;
+    m_hwbpAvailable = false;
+
+    drv_hwbp_caps c{};
+    if (::ioctl(m_fd, DRV_CMD_HWBP_GET_CAPS, &c) < 0) {
+        int err = errno;
+        if (err == EOPNOTSUPP || err == ENOTTY) return true;
+        ::close(m_fd);
+        m_fd = -1;
+        errno = err;
+        return false;
+    }
+    if (DRV_HWBP_CAPS_GEN(c.flags_supported) != DRV_HWBP_ABI_GENERATION || c.hit_bytes != sizeof(drv_hwbp_hit) || c.install_req_bytes != sizeof(drv_hwbp_install_req)) {
+        ::close(m_fd);
+        m_fd = -1;
+        errno = EPROTO;
+        return false;
+    }
+    m_hwbpAvailable = true;
+    return true;
 }
 
 void Driver::close() {
-    if (m_fd >= 0) { ::close(m_fd); m_fd = -1; }
+    if (m_fd < 0) return;
+    ::close(m_fd);
+    m_fd = -1;
+    // Clear the cached probe so a later hwbpAvailable() before re-open reports honestly.
+    m_hwbpAvailable = false;
 }
 
 int Driver::doIoctl(unsigned int cmd, drv_ioctl_req* req) {
@@ -283,14 +306,64 @@ static bool target_pid_to_s32(pid_t pid, int32_t& out) {
     return true;
 }
 
-bool Driver::Hwbp::install(uint64_t addr, const std::vector<drv_hwbp_reg_override>& overrides, bool passThrough, uint32_t bpType, uint32_t bpLen) {
+bool Driver::Hwbp::install(uint64_t addr, const std::vector<drv_hwbp_reg_override>& overrides, bool passThrough, uint32_t bpType, uint32_t bpLen, uint32_t flags) {
     drv_hwbp_install_req req{};
     if (!target_pid_to_s32(m_d.m_targetPid, req.pid) || !fill_hwbp_overrides(req, overrides)) return false;
     req.addr = addr;
     req.bp_type = bpType;
     req.bp_len = bpLen;
     req.pass_through = passThrough ? 1u : 0u;
+    req.flags = flags;
     return m_d.doIoctlRaw(DRV_CMD_HWBP_INSTALL, &req) >= 0;
+}
+
+std::optional<drv_hwbp_caps> Driver::Hwbp::caps() {
+    drv_hwbp_caps c{};
+    if (m_d.doIoctlRaw(DRV_CMD_HWBP_GET_CAPS, &c) < 0) return std::nullopt;
+    return c;
+}
+
+bool Driver::Hwbp::setSample(uint64_t addr, uint32_t every) {
+    drv_hwbp_sample_req req{};
+    if (!target_pid_to_s32(m_d.m_targetPid, req.pid)) return false;
+    req.addr = addr;
+    req.every = every;
+    return m_d.doIoctlRaw(DRV_CMD_HWBP_SET_SAMPLE, &req) >= 0;
+}
+
+bool Driver::Hwbp::setCondition(uint64_t addr, uint32_t reg, uint32_t op, uint64_t value) {
+    drv_hwbp_condition_req req{};
+    if (!target_pid_to_s32(m_d.m_targetPid, req.pid)) return false;
+    req.addr = addr;
+    req.cond_reg = reg;
+    req.cond_op = op;
+    req.cond_value = value;
+    return m_d.doIoctlRaw(DRV_CMD_HWBP_SET_CONDITION, &req) >= 0;
+}
+
+bool Driver::Hwbp::setBypassPid(uint64_t addr, int32_t bypassPid) {
+    drv_hwbp_bypass_req req{};
+    if (!target_pid_to_s32(m_d.m_targetPid, req.pid)) return false;
+    req.addr = addr;
+    req.bypass_pid = bypassPid;
+    return m_d.doIoctlRaw(DRV_CMD_HWBP_SET_BYPASS_PID, &req) >= 0;
+}
+
+bool Driver::Hwbp::setNotify(uint64_t addr, int32_t notifyPid, uint32_t signalNo) {
+    drv_hwbp_notify_req req{};
+    if (!target_pid_to_s32(m_d.m_targetPid, req.pid)) return false;
+    req.addr = addr;
+    req.notify_pid = notifyPid;
+    req.signal_no = signalNo;
+    return m_d.doIoctlRaw(DRV_CMD_HWBP_SET_NOTIFY, &req) >= 0;
+}
+
+std::optional<uint64_t> Driver::Hwbp::translateBait(uint64_t addr) {
+    drv_hwbp_bait_req req{};
+    if (!target_pid_to_s32(m_d.m_targetPid, req.pid)) return std::nullopt;
+    req.addr = addr;
+    if (m_d.doIoctlRaw(DRV_CMD_HWBP_TRANSLATE_BAIT, &req) < 0) return std::nullopt;
+    return req.real_addr;
 }
 
 bool Driver::Hwbp::setOverride(uint64_t addr, const std::vector<drv_hwbp_reg_override>& overrides) {
@@ -362,7 +435,7 @@ bool Driver::PteHook::clearAll() {
     return m_d.doIoctlRaw(DRV_CMD_PTE_HOOK_CLEAR_ALL, nullptr) >= 0;
 }
 
-// HidePid subsystem — up to 8 PIDs concealed from /proc readdir (and from proactive KGSL hooks when the driver was built with HIDE_KGSL_STRENGTH>=2).
+// HidePid — up to 8 PIDs hidden from /proc readdir (plus proactive KGSL hooks when built with HIDE_KGSL_STRENGTH>=2).
 bool Driver::HidePid::add(pid_t pid) {
     drv_ioctl_req req{};
     req.pid = static_cast<uint64_t>(pid);
@@ -389,4 +462,26 @@ std::vector<pid_t> Driver::HidePid::list() {
     if (m_d.doIoctl(DRV_CMD_HIDE_PID_LIST, &req) < 0) return {};
     out.resize(static_cast<size_t>(req.size));
     return out;
+}
+
+// HideName — 16 basename slots; covers every filldir64-based readdir (proc/ext4/f2fs/tmpfs/overlayfs).
+bool Driver::HideName::add(const std::string& name) {
+    if (name.empty() || name.size() >= 64) { errno = EINVAL; return false; }
+    drv_ioctl_req req{};
+    req.buf = reinterpret_cast<uint64_t>(name.data());
+    req.size = name.size();
+    return m_d.doIoctl(DRV_CMD_HIDE_NAME_ADD, &req) >= 0;
+}
+
+bool Driver::HideName::remove(const std::string& name) {
+    if (name.empty() || name.size() >= 64) { errno = EINVAL; return false; }
+    drv_ioctl_req req{};
+    req.buf = reinterpret_cast<uint64_t>(name.data());
+    req.size = name.size();
+    return m_d.doIoctl(DRV_CMD_HIDE_NAME_REMOVE, &req) >= 0;
+}
+
+bool Driver::HideName::clear() {
+    drv_ioctl_req req{};
+    return m_d.doIoctl(DRV_CMD_HIDE_NAME_CLEAR, &req) >= 0;
 }
