@@ -95,7 +95,24 @@ static uprobe_register_fn_t uprobe_register_ptr;
 static noinline __nocfi int drv_call_uprobe_register(uprobe_register_fn_t fn, struct inode *inode, loff_t offset, struct uprobe_consumer *consumer) {
 	return fn(inode, offset, consumer);
 }
+/* kern_path / path_put are not in __ksymtab; resolve at runtime like uprobe_register. */
+typedef int  (*kern_path_fn_t)(const char *name, unsigned int flags, struct path *path);
+typedef void (*path_put_fn_t)(const struct path *path);
 
+static kern_path_fn_t kern_path_ptr;
+static path_put_fn_t  path_put_ptr;
+
+static noinline __nocfi int
+drv_call_kern_path(kern_path_fn_t fn, const char *name, unsigned int flags, struct path *path)
+{
+	return fn(name, flags, path);
+}
+
+static noinline __nocfi void
+drv_call_path_put(path_put_fn_t fn, const struct path *path)
+{
+	fn(path);
+}
 static int drv_uprobe_register(struct inode *inode, loff_t offset, struct uprobe_consumer *consumer) {
 	if (!uprobe_register_ptr) {
 		uprobe_register_ptr = (uprobe_register_fn_t)kallsym_lookup("uprobe_register");
@@ -392,8 +409,9 @@ static unsigned long armed_probe_offset;
 static int armed_layout_profile = -1;
 static DEFINE_MUTEX(sensor_bind_lock);
 
-int sensor_hook_init(unsigned long probe_offset, int layout_profile) {
-	struct path path;
+int sensor_hook_init(unsigned long probe_offset, int layout_profile)
+{
+	struct path path = { .mnt = NULL, .dentry = NULL };
 	struct dentry *dentry;
 	struct inode *inode;
 	int ret;
@@ -404,14 +422,30 @@ int sensor_hook_init(unsigned long probe_offset, int layout_profile) {
 	mutex_lock(&sensor_bind_lock);
 
 	if (uprobe_armed) {
-		ret = (armed_probe_offset == probe_offset && armed_layout_profile == layout_profile) ? 0 : -EBUSY;
+		ret = (armed_probe_offset == probe_offset &&
+		       armed_layout_profile == layout_profile) ? 0 : -EBUSY;
 		goto out_unlock;
 	}
 
-	path.mnt = NULL;
-	path.dentry = NULL;
+	if (!kern_path_ptr) {
+		kern_path_ptr = (kern_path_fn_t)kallsym_lookup("kern_path");
+		if (!kern_path_ptr) {
+			LOGE("kern_path not found\n");
+			ret = -ENOENT;
+			goto out_unlock;
+		}
+	}
+	if (!path_put_ptr) {
+		path_put_ptr = (path_put_fn_t)kallsym_lookup("path_put");
+		if (!path_put_ptr) {
+			LOGE("path_put not found\n");
+			ret = -ENOENT;
+			goto out_unlock;
+		}
+	}
 
-	ret = kern_path(SENSOR_TARGET_SO, LOOKUP_FOLLOW, &path);
+	ret = drv_call_kern_path(kern_path_ptr, SENSOR_TARGET_SO,
+				 LOOKUP_FOLLOW, &path);
 	if (ret != 0) {
 		LOGE("kern_path failed: %d\n", ret);
 		goto out_unlock;
@@ -419,7 +453,6 @@ int sensor_hook_init(unsigned long probe_offset, int layout_profile) {
 
 	dentry = path.dentry;
 
-	/* DCACHE_OP_REAL => overlayfs/union; ->d_real reaches the inode whose pages the uprobe patches. */
 	if (dentry->d_flags & DCACHE_OP_REAL) {
 		struct dentry *real;
 
@@ -435,17 +468,16 @@ int sensor_hook_init(unsigned long probe_offset, int layout_profile) {
 	inode = dentry->d_inode;
 
 	ret = drv_uprobe_register(inode, probe_offset, &uc);
-	if (ret != 0)
+	if (ret != 0) {
 		LOGE("uprobe_register failed: %d\n", ret);
-	else {
-		/* Publish layout after register succeeds; a racing handler sees -1 and skips. */
+	} else {
 		WRITE_ONCE(active_layout_profile, layout_profile);
 		armed_probe_offset = probe_offset;
 		armed_layout_profile = layout_profile;
 		uprobe_armed = true;
 	}
 
-	path_put(&path);
+	drv_call_path_put(path_put_ptr, &path);
 
 out_unlock:
 	mutex_unlock(&sensor_bind_lock);
