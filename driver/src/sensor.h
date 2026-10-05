@@ -7,7 +7,7 @@
 #include <linux/uprobes.h>
 
 #ifndef SENSOR_TARGET_SO
-#define SENSOR_TARGET_SO "/system/lib64/libsensorservice.so"
+#define SENSOR_TARGET_SO "/system/lib64/libsensorserviceaidl.so"
 #endif
 
 /* @layout_profile = enum drv_sensor_layout: HIDL Vec3 at +0x10, AIDL tagged payload at +0x18. */
