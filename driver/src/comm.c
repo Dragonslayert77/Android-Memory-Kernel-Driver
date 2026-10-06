@@ -109,12 +109,7 @@ struct kprobe reboot_kp = {
 	.symbol_name = "__arm64_sys_reboot",
 	.pre_handler = reboot_handler_pre,
 };
-void sensor_hook_write(u32 x_bits, u32 y_bits, u32 enable)
-{
-    WRITE_ONCE(gyro_x, x_bits);
-    WRITE_ONCE(gyro_y, y_bits);
-    WRITE_ONCE(gyro_enable, enable ? 1u : 0u);
-}
+
 static bool drv_read_wrapped_syscall_args(struct pt_regs *regs, unsigned long args[4]) {
 	unsigned long pt_regs_ptr;
 
