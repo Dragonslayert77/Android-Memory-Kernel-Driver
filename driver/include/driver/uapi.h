@@ -90,7 +90,7 @@ enum drv_cmd {
 	DRV_CMD_TOUCH_SLOT_LEGACY = 0x136,
 
 	/* pid == 100 binds a sensor uprobe; otherwise this updates gyro values. */
-	DRV_CMD_SENSOR_BIND = 0x140,
+
 
 	/* These values enter the lazy input initialization path. */
 	DRV_CMD_INPUT_RANGE_FIRST = 0x12D,
