@@ -65,11 +65,6 @@ enum drv_cmd {
 	DRV_CMD_HIDE_KGSL = 0x13,
 	DRV_CMD_MULTI_READ = 0x14,
 	DRV_CMD_DUMP_VMAS = 0x15,
-	/* pid == 100 binds a sensor uprobe; otherwise this updates gyro values. */
-    DRV_CMD_SENSOR_BIND = 0x140,
-
-/* Set gyro_x / gyro_y / enable. Payload is struct drv_sensor_write_req. */
-    DRV_CMD_SENSOR_WRITE = 0x141,
 	/* Exact argv[0] lookup using drv_find_pid_req. */
 	DRV_CMD_FIND_PID_BY_PACKAGE = 0x16,
 	/* Writes APGA keys to req.size (lo) and req.extra (hi). */

@@ -73,11 +73,6 @@ u8 gyro_enable;
 u32 gyro_x;
 u32 gyro_y;
 
-/* ---------------- debug counters (remove after verification) ---------------- */
-
-static atomic64_t dbg_handler_hits = ATOMIC64_INIT(0);
-static atomic64_t dbg_writes = ATOMIC64_INIT(0);
-
 /* ---------------- kallsym-resolved kernel helpers ---------------- */
 
 /* kern_path / path_put are not in __ksymtab; resolve at runtime like uprobe_register. */
@@ -197,15 +192,6 @@ int handler_pre(struct uprobe_consumer *self, struct pt_regs *regs)
 	u32 sensor_type = 0;
 	u32 payload_tag = 0;
 	u32 xy[2] = { 0, 0 };
-	u64 hit_n;
-
-	/* --- DEBUG: remove after verification --- */
-	hit_n = atomic64_inc_return(&dbg_handler_hits);
-	if (hit_n <= 8 || (hit_n & 1023) == 0)
-		LOGE("hit #%llu layout=%d x0=%px\n",
-		     hit_n, slot->layout_profile,
-		     (void *)(regs ? regs->regs[0] : 0));
-	/* --- END DEBUG --- */
 
 	if (gyro_enable == 0)
 		return 0;
@@ -227,19 +213,8 @@ int handler_pre(struct uprobe_consumer *self, struct pt_regs *regs)
 	/* SensorType::GYROSCOPE == 4 in both HIDL V1.0 and sensors AIDL. */
 	if (copy_from_user(&sensor_type,
 			   (void __user *)(user_ptr + layout->type_off),
-			   sizeof(sensor_type)) != 0) {
-		/* --- DEBUG: remove after verification --- */
-		if (hit_n <= 4)
-			LOGE("type read fault @ x0+%u\n", layout->type_off);
-		/* --- END DEBUG --- */
+			   sizeof(sensor_type)) != 0)
 		return 0;
-	}
-
-	/* --- DEBUG: remove after verification --- */
-	if (hit_n <= 4)
-		LOGE("read type=%u\n", sensor_type);
-	/* --- END DEBUG --- */
-
 	if (sensor_type != 4)
 		return 0;
 
@@ -250,14 +225,6 @@ int handler_pre(struct uprobe_consumer *self, struct pt_regs *regs)
 				   (void __user *)(user_ptr + layout->tag_off),
 				   sizeof(payload_tag)) != 0)
 			return 0;
-
-		/* --- DEBUG: remove after verification --- */
-		if (hit_n <= 4)
-			LOGE("tag=%u want=%u ok=%d\n",
-			     payload_tag, layout->tag_value,
-			     payload_tag == layout->tag_value);
-		/* --- END DEBUG --- */
-
 		if (payload_tag != layout->tag_value)
 			return 0;
 	}
@@ -266,28 +233,12 @@ int handler_pre(struct uprobe_consumer *self, struct pt_regs *regs)
 			   sizeof(xy)) != 0)
 		return 0;
 
-	/* --- DEBUG: remove after verification --- */
-	if (hit_n <= 4)
-		LOGE("pre  x=%08x y=%08x add=%08x/%08x\n",
-		     xy[0], xy[1], gyro_x, gyro_y);
-	/* --- END DEBUG --- */
-
 	xy[0] = fadd(xy[0], gyro_x);
 	xy[1] = fadd(xy[1], gyro_y);
 
 	if (copy_to_user((void __user *)(user_ptr + layout->data_off), xy,
-			 sizeof(xy)) != 0) {
-		/* --- DEBUG: remove after verification --- */
-		if (hit_n <= 4)
-			LOGE("write fault @ x0+%u\n", layout->data_off);
-		/* --- END DEBUG --- */
+			 sizeof(xy)) != 0)
 		return 0;
-	}
-
-	/* --- DEBUG: remove after verification --- */
-	if (hit_n <= 8 || hit_n == 1024)
-		LOGE("post x=%08x y=%08x\n", xy[0], xy[1]);
-	/* --- END DEBUG --- */
 
 	return 0;
 }
@@ -320,7 +271,6 @@ u32 fadd(u32 a, u32 b) {
 	sig_a = (((a >> 23) & 0xFFu) != 0) ? ((mant_a << 7) | 0x40000000u) : (mant_a << 7);
 	sig_b = (((b >> 23) & 0xFFu) != 0) ? ((mant_b << 7) | 0x40000000u) : (mant_b << 7);
 
-	/* Biased exponents clamped to >= 1 for gradual-underflow alignment. */
 	exp_a = ((a >> 23) & 0xFFu);
 	if (exp_a <= 1u)
 		exp_a = 1u;
@@ -343,9 +293,8 @@ u32 fadd(u32 a, u32 b) {
 		result = ((sign_a != sign_b) && both_inf) ? 0x7FFFFFFFu : a;
 
 		if (!a_is_inf) {
-			if (mant_b == 0 && exp_b == 0xFFu) {
+			if (mant_b == 0 && exp_b == 0xFFu)
 				return b;
-			}
 
 			if (exp_a >= exp_b) {
 				shift = (int)(exp_a - exp_b);
@@ -417,7 +366,6 @@ u32 fadd(u32 a, u32 b) {
 				u32 base_exp;
 
 				if (leading_pos >= 24) {
-					/* Sticky = OR of mantissa bits below the round bit; unrolled-by-2 for original codegen. */
 					int bound = leading_pos - 23;
 
 					if (bound > 1) {
@@ -471,7 +419,6 @@ u32 fadd(u32 a, u32 b) {
 					if (round_bit == 1 && sticky == 1) {
 						carry = 1;
 					} else if (round_bit == 1 && sticky == 0) {
-						/* Halfway: ties to even. */
 						carry = pre_mant & 1u;
 					} else {
 						carry = 0;
@@ -494,24 +441,6 @@ u32 fadd(u32 a, u32 b) {
 	}
 
 	return result;
-}
-
-/* ---------------- write path ---------------- */
-
-void sensor_hook_write(u32 x_bits, u32 y_bits, u32 enable)
-{
-	u64 n;
-
-	n = atomic64_inc_return(&dbg_writes);
-	WRITE_ONCE(gyro_x, x_bits);
-	WRITE_ONCE(gyro_y, y_bits);
-	WRITE_ONCE(gyro_enable, enable ? 1u : 0u);
-
-	/* --- DEBUG: remove after verification --- */
-	if (n <= 8 || (n & 255) == 0)
-		LOGE("write #%llu x=%08x y=%08x en=%u\n",
-		     n, x_bits, y_bits, enable);
-	/* --- END DEBUG --- */
 }
 
 /* ---------------- slot management ---------------- */
@@ -550,9 +479,6 @@ int sensor_hook_init(const char *path, unsigned long probe_offset,
 	    layout_profile >= DRV_SENSOR_LAYOUT_COUNT)
 		return -EINVAL;
 
-	if (path[0] == '\0')
-		return -EINVAL;
-
 	mutex_lock(&sensor_bind_lock);
 
 	kpath.mnt = NULL;
@@ -582,8 +508,6 @@ int sensor_hook_init(const char *path, unsigned long probe_offset,
 	inode = dentry->d_inode;
 
 	if (sensor_find_duplicate(inode, probe_offset)) {
-		LOGE("sensor dup: %s+0x%lx already armed\n",
-		     path, probe_offset);
 		ret = 0;
 		drv_path_put(&kpath);
 		goto out_unlock;
@@ -591,8 +515,6 @@ int sensor_hook_init(const char *path, unsigned long probe_offset,
 
 	slot = sensor_find_free_slot();
 	if (!slot) {
-		LOGE("sensor: no free slot for %s+0x%lx\n",
-		     path, probe_offset);
 		ret = -ENOSPC;
 		drv_path_put(&kpath);
 		goto out_unlock;
@@ -613,9 +535,8 @@ int sensor_hook_init(const char *path, unsigned long probe_offset,
 	}
 
 	slot->armed = true;
-	LOGE("sensor armed: %s+0x%lx layout=%d ino=%lu\n",
-	     path, probe_offset, layout_profile,
-	     (unsigned long)inode->i_ino);
+	LOGE("sensor armed: %s+0x%lx layout=%d\n",
+	     path, probe_offset, layout_profile);
 
 	drv_path_put(&kpath);
 
