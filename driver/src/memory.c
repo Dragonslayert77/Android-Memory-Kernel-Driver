@@ -90,7 +90,12 @@ drv_call_anon_vma_name(drv_anon_vma_name_fn_t fn, struct vm_area_struct *vma)
 }
 
 static noinline __nocfi int drv_call_get_cmdline(drv_get_cmdline_fn_t fn, struct task_struct *task, char *buffer, int buflen) { return fn(task, buffer, buflen); }
-
+/* CFI-safe wrapper: kallsyms-resolved target was not built with matching CFI metadata. */
+static noinline __nocfi int
+drv_call_insn_patch_text_nosync(drv_insn_patch_text_nosync_fn_t fn, void *addr, u32 insn)
+{
+	return fn(addr, insn);
+}
 int memory_init(void) {
 	unsigned long addr;
 	addr = kallsym_lookup("anon_vma_name");
