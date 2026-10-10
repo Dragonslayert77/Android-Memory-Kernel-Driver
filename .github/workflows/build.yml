@@ -79,6 +79,8 @@ jobs:
           - android14-6.1
           - android15-6.6
           - android16-6.12
+          - android11-5.4    
+          - android12-5.4      
 
     container:
       image: ghcr.io/ylarod/ddk:${{ matrix.kmi }}-${{ inputs.ddk_release || '20251104' }}
