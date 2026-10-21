@@ -166,7 +166,7 @@ u32 kf_sub(u32 a, u32 b) { return kf_add(a, kf_neg(b)); }
  *
  * The correction vs. the old code:
  *   if (prod & (1<<47)) { shift=24; exp += 1; }
- *   else                { shift=23; /* exp unchanged *\/ }
+ *   else                { shift=23; }  (exp unchanged)
  */
  u32 kf_mul(u32 a, u32 b)
  {
@@ -257,6 +257,7 @@ u32 kf_sub(u32 a, u32 b) { return kf_add(a, kf_neg(b)); }
          u32 inner = kf_sub(KF_1P5, xyy);
          y = kf_mul(y, inner);
      }
+
      return y;
  }
 
@@ -271,10 +272,11 @@ u32 kf_sub(u32 a, u32 b) { return kf_add(a, kf_neg(b)); }
      len_sq = kf_add(kf_add(xx, yy), zz);
 
      abs_ls = len_sq & 0x7FFFFFFFu;
-     if (abs_ls == 0 || abs_ls >= 0x7F800000u)
+     if (abs_ls == 0 || abs_ls >= 0x7F800000u) {
          return -ERANGE;   /* zero length or non-finite */
+     }
 
-         inv_len = kf_rsqrt(len_sq);
+     inv_len = kf_rsqrt(len_sq);
 
      *vx = kf_mul(*vx, inv_len);
      *vy = kf_mul(*vy, inv_len);
