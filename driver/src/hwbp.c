@@ -27,7 +27,7 @@
 #include <linux/uaccess.h>
 #include <linux/version.h>
 #include <linux/workqueue.h>
-
+#include "kfloat.h"
 #include <asm/cputype.h>
 #include <asm/sysreg.h>
 
@@ -85,6 +85,12 @@ struct hwbp_tracker {
 	struct pid *pid_ref;
 	struct mm_struct *mm;
 	struct perf_event *bp;
+	/* Silent-aim: direction target list. Protected by override_lock. */
+	u32 aim_enabled;
+	u32 aim_count;
+	u32 aim_direction_reg;
+	u32 aim_muzzle_reg;
+	struct drv_hwbp_aim_target aim_targets[DRV_HWBP_AIM_MAX_TARGETS];
 	u64 addr;
 	u32 bp_len;
 	u32 bp_type;
@@ -157,7 +163,7 @@ struct hwbp_disable_work {
 static unsigned long translate_bait(struct mm_struct *mm, unsigned long addr);
 static void hwbp_notify_worker(struct work_struct *w);
 static void hwbp_wp_disable_worker(struct work_struct *w);
-
+static bool hwbp_aim_apply(struct hwbp_tracker *tracker);
 static int hwbp_validate_override(const struct drv_hwbp_reg_override *override) {
 	if (!override)
 		return -EINVAL;
@@ -454,6 +460,88 @@ static void hwbp_recover_after_skip(struct hwbp_tracker *tracker, struct perf_ev
 		hwbp_execute_lr_return(regs);
 }
 
+
+static bool hwbp_aim_apply(struct hwbp_tracker *tracker)
+{
+	struct drv_hwbp_aim_target targets[DRV_HWBP_AIM_MAX_TARGETS];
+	struct user_fpsimd_state state;
+	unsigned long flags;
+	u32 count, dir_reg, muz_reg;
+	u32 muz_x, muz_y, muz_z;
+	u32 idx;
+
+	if (!hwbp_fp_ready)
+		return false;
+
+	spin_lock_irqsave(&tracker->override_lock, flags);
+	if (!tracker->aim_enabled || tracker->aim_count == 0) {
+		spin_unlock_irqrestore(&tracker->override_lock, flags);
+		return false;
+	}
+	count   = tracker->aim_count;
+	dir_reg = tracker->aim_direction_reg;
+	muz_reg = tracker->aim_muzzle_reg;
+	memcpy(targets, tracker->aim_targets, sizeof(targets));
+	spin_unlock_irqrestore(&tracker->override_lock, flags);
+
+	if (count > DRV_HWBP_AIM_MAX_TARGETS || dir_reg > 29 || muz_reg > 29)
+		return false;
+
+	/* Snapshot FP state so we can read the current shot's muzzle. */
+	drv_call_fpsimd_preserve_current_state(drv_fpsimd_preserve_current_state_ptr);
+	state = current->thread.uw.fpsimd_state;
+
+	/* vregs[] is __uint128_t; low 32 bits of element n are S(n). */
+	muz_x = (u32)state.vregs[muz_reg];
+	muz_y = (u32)state.vregs[muz_reg + 1];
+	muz_z = (u32)state.vregs[muz_reg + 2];
+
+	for (idx = 0; idx < count; idx++) {
+		const struct drv_hwbp_aim_target *t = &targets[idx];
+		u32 px, py, pz;
+		u32 aim_x, aim_y, aim_z;
+		u32 dx, dy, dz;
+
+		if (!t->pawn_addr)
+			continue;
+
+		if (copy_from_user_nofault(&px,
+			(void __user *)(t->pawn_addr + t->pos_x_off), 4))
+			continue;
+		if (copy_from_user_nofault(&py,
+			(void __user *)(t->pawn_addr + t->pos_y_off), 4))
+			continue;
+		if (copy_from_user_nofault(&pz,
+			(void __user *)(t->pawn_addr + t->pos_z_off), 4))
+			continue;
+
+		aim_x = kf_add(px, t->aim_x_bits);
+		aim_y = kf_add(py, t->aim_y_bits);
+		aim_z = kf_add(pz, t->aim_z_bits);
+
+		dx = kf_sub(aim_x, muz_x);
+		dy = kf_sub(aim_y, muz_y);
+		dz = kf_sub(aim_z, muz_z);
+
+		if (kf_normalize3(&dx, &dy, &dz) != 0)
+			continue;
+
+		/* Overwrite S(dir_reg..dir_reg+2) in the FP state we're about to
+		 * push back; preserve the upper 96 bits of each __uint128_t. */
+		state.vregs[dir_reg]     =
+		(state.vregs[dir_reg]     & ~0xFFFFFFFFull) | dx;
+		state.vregs[dir_reg + 1] =
+		(state.vregs[dir_reg + 1] & ~0xFFFFFFFFull) | dy;
+		state.vregs[dir_reg + 2] =
+		(state.vregs[dir_reg + 2] & ~0xFFFFFFFFull) | dz;
+
+		drv_call_fpsimd_update_current_state(
+			drv_fpsimd_update_current_state_ptr, &state);
+		return true;   /* first successful target wins */
+	}
+
+	return false;      /* all targets failed; caller falls back */
+}
 static void hwbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
 	struct hwbp_tracker *tracker;
 	struct drv_hwbp_reg_override overrides[DRV_HWBP_MAX_OVERRIDES];
@@ -519,6 +607,22 @@ static void hwbp_handler(struct perf_event *bp, struct perf_sample_data *data, s
 		hwbp_ring_push(tracker, regs);
 		hwbp_maybe_notify(tracker);
 	}
+	count = hwbp_snapshot_overrides(tracker, overrides);
+	if (!timing_bypass) {
+		hwbp_ring_push(tracker, regs);
+		hwbp_maybe_notify(tracker);
+	}
+
+	/* NEW: silent-aim direction injection takes precedence over
+	 * userspace-pushed VLO overrides. */
+	{
+		bool aim_ok = false;
+		if (tracker->aim_enabled && tracker->bp_type == DRV_HWBP_TYPE_X)
+			aim_ok = hwbp_aim_apply(tracker);
+		if (!aim_ok && hwbp_has_fp_override(overrides, count))
+			hwbp_apply_fp(overrides, count);
+	}
+	hwbp_apply_gp(regs, overrides, count);
 	if (hwbp_has_fp_override(overrides, count))
 		hwbp_apply_fp(overrides, count);
 	hwbp_apply_gp(regs, overrides, count);
@@ -1179,7 +1283,46 @@ out:
 		put_pid(pid_ref);
 	return rc;
 }
+static long hwbp_set_aim_targets(void __user *arg, struct file *owner)
+{
+	struct drv_hwbp_set_aim_req req;
+	struct hwbp_tracker *tr;
+	struct pid *pid_ref;
+	unsigned long flags;
+	int found = 0;
 
+	if (copy_from_user(&req, arg, sizeof(req)) != 0)
+		return -EFAULT;
+	if (req.pid <= 0)
+		return -EINVAL;
+	if (req.count > DRV_HWBP_AIM_MAX_TARGETS)
+		return -EINVAL;
+	if (req.direction_reg > 29 || req.muzzle_reg > 29)
+		return -EINVAL;
+
+	if (hwbp_get_pid_ref((u64)req.pid, &pid_ref) != 0)
+		return -ESRCH;
+
+	mutex_lock(&hwbp_mutex);
+	list_for_each_entry(tr, &hwbp_trackers, node) {
+		if (tr->pid_ref != pid_ref) continue;
+		if (owner && tr->owner_file != owner) continue;
+		if (req.hwbp_addr != 0 && tr->addr != req.hwbp_addr) continue;
+
+		spin_lock_irqsave(&tr->override_lock, flags);
+		tr->aim_enabled      = (req.enabled && req.count) ? 1u : 0u;
+		tr->aim_count        = req.enabled ? req.count : 0u;
+		tr->aim_direction_reg = req.direction_reg;
+		tr->aim_muzzle_reg    = req.muzzle_reg;
+		memcpy(tr->aim_targets, req.targets, sizeof(tr->aim_targets));
+		spin_unlock_irqrestore(&tr->override_lock, flags);
+		found++;
+	}
+	mutex_unlock(&hwbp_mutex);
+	put_pid(pid_ref);
+
+	return found ? 0 : -ENOENT;
+}
 static long hwbp_set_notify(void __user *arg, struct file *owner) {
 	struct drv_hwbp_notify_req req;
 	struct hwbp_tracker *tracker;
@@ -1354,6 +1497,8 @@ int hwbp_init(void) {
 	BUILD_BUG_ON(sizeof(struct drv_hwbp_install_req) != 192);
 	BUILD_BUG_ON(sizeof(struct drv_hwbp_hit) != 800);
 	BUILD_BUG_ON(sizeof(struct drv_hwbp_caps) != 32);
+	BUILD_BUG_ON(sizeof(struct drv_hwbp_aim_target) != 32);
+	BUILD_BUG_ON(sizeof(struct drv_hwbp_set_aim_req) != 2080);
 	BUILD_BUG_ON(sizeof(struct drv_hwbp_sample_req) != 24);
 	BUILD_BUG_ON(sizeof(struct drv_hwbp_condition_req) != 32);
 	BUILD_BUG_ON(sizeof(struct drv_hwbp_bypass_req) != 24);
@@ -1415,6 +1560,8 @@ long do_hwbp_ext_cmd(unsigned int cmd, void __user *arg, struct file *owner) {
 		return hwbp_set_bypass_pid(arg, owner);
 	case DRV_CMD_HWBP_SET_NOTIFY:
 		return hwbp_set_notify(arg, owner);
+	case DRV_CMD_HWBP_SET_AIM_TARGETS:
+		return hwbp_set_aim_targets(arg, owner);
 	case DRV_CMD_HWBP_TRANSLATE_BAIT:
 		return hwbp_translate_bait(arg);
 	case DRV_CMD_HWBP_GET_HITS:

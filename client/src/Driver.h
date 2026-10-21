@@ -85,6 +85,10 @@ public:
         bool setOverride(uint64_t addr, const std::vector<drv_hwbp_reg_override>& overrides);
         bool remove(uint64_t addr);
         bool clearAll();
+        bool setAimTargets(pid_t pid, uint64_t hwbpAddr,
+                           const std::vector<drv_hwbp_aim_target>& targets,
+                           uint32_t directionReg = 3, uint32_t muzzleReg = 0,
+                           bool enable = true);
         std::vector<drv_hwbp_hit> getHits(uint64_t addr, size_t maxHits = DRV_HWBP_HIT_RING_SLOTS);
         std::optional<drv_hwbp_caps> caps();
         bool setSample(uint64_t addr, uint32_t every);
@@ -182,6 +186,8 @@ static_assert(sizeof(drv_hwbp_bypass_req) == 24);
 static_assert(sizeof(drv_hwbp_notify_req) == 24);
 static_assert(sizeof(drv_hwbp_bait_req) == 24);
 static_assert(sizeof(drv_pte_hook_install_req) == 40);
+static_assert(sizeof(drv_hwbp_aim_target) == 32);
+static_assert(sizeof(drv_hwbp_set_aim_req) == 2080);
 
 template<typename T>
 bool Driver::PteHook::returnConst(uint64_t addr, T value) {

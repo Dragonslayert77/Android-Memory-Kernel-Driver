@@ -101,12 +101,13 @@ enum drv_cmd {
 	DRV_CMD_HWBP_SET_OVERRIDE = 0x42,
 	/* 0x43 was 280-byte GET_HITS; record now 800 bytes with FPSIMD, moved to 0x63. */
 	DRV_CMD_HWBP_GET_HITS_LEGACY = 0x43, /* rejects with -EPROTO; new number is 0x63 (gen 2) */
+	DRV_CMD_HWBP_SET_AIM_TARGETS = 0x64,
 	DRV_CMD_HWBP_CLEAR_ALL = 0x44,
 	DRV_CMD_HWBP_GET_CAPS = 0x45,
 	DRV_CMD_HWBP_SET_SAMPLE = 0x46,
 	DRV_CMD_HWBP_SET_CONDITION = 0x47,
 	DRV_CMD_HWBP_RANGE_FIRST = DRV_CMD_HWBP_INSTALL,
-	DRV_CMD_HWBP_RANGE_LAST = DRV_CMD_HWBP_SET_CONDITION,
+	DRV_CMD_HWBP_EXT_RANGE_LAST = DRV_CMD_HWBP_SET_AIM_TARGETS,
 
 	DRV_CMD_PTE_HOOK_INSTALL = 0x48,
 	DRV_CMD_PTE_HOOK_REMOVE = 0x49,
@@ -307,7 +308,32 @@ struct drv_hwbp_bait_req {
 	__u64 addr; /* user-supplied "bait" address */
 	__u64 real_addr; /* [out] translated address (equal to input if no translation) */
 };
+#define DRV_HWBP_AIM_MAX_TARGETS 64u
 
+/* One target entry pushed by userspace. Kernel reads pawn_pos[xyz] fresh
+ * at the moment of the shot, adds aim_offset[xyz], then normalizes
+ * (aim - muzzle) where muzzle is read from the HWBP-captured FP state. */
+struct drv_hwbp_aim_target {
+	__u64 pawn_addr;      /* userspace VA of the pawn */
+	__u32 pos_x_off;      /* offset of float pos_x within pawn */
+	__u32 pos_y_off;
+	__u32 pos_z_off;
+	__u32 aim_x_bits;     /* float bits added to pos_x (body height / lead) */
+	__u32 aim_y_bits;
+	__u32 aim_z_bits;
+	__u32 _pad;
+};
+
+struct drv_hwbp_set_aim_req {
+	__s32 pid;
+	__u32 count;             /* 0 == disable, otherwise 1..MAX */
+	__u64 hwbp_addr;         /* 0 = apply to every owned tracker on pid+fd */
+	__u32 direction_reg;     /* V-index for dir_x; V, V+1, V+2 (default 3) */
+	__u32 muzzle_reg;        /* V-index for muzzle_x; V, V+1, V+2 (default 0) */
+	__u32 enabled;
+	__u32 _pad;
+	struct drv_hwbp_aim_target targets[DRV_HWBP_AIM_MAX_TARGETS];
+};
 /* AArch64 user-code return-stub ABI. TRAMPOLINE is reserved for v2. */
 enum drv_pte_hook_kind {
 	DRV_PTE_HOOK_CONST_U64 = 0,

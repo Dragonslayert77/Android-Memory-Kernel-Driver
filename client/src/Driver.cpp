@@ -316,7 +316,25 @@ bool Driver::Hwbp::install(uint64_t addr, const std::vector<drv_hwbp_reg_overrid
     req.flags = flags;
     return m_d.doIoctlRaw(DRV_CMD_HWBP_INSTALL, &req) >= 0;
 }
-
+bool Driver::Hwbp::setAimTargets(pid_t pid, uint64_t hwbpAddr,
+                                 const std::vector<drv_hwbp_aim_target>& targets,
+                                 uint32_t directionReg, uint32_t muzzleReg,
+                                 bool enable)
+{
+    if (targets.size() > DRV_HWBP_AIM_MAX_TARGETS)
+        return false;
+    drv_hwbp_set_aim_req req{};
+    if (!target_pid_to_s32(pid, req.pid))
+        return false;
+    req.hwbp_addr     = hwbpAddr;
+    req.count         = static_cast<uint32_t>(targets.size());
+    req.direction_reg = directionReg;
+    req.muzzle_reg    = muzzleReg;
+    req.enabled       = enable ? 1u : 0u;
+    for (size_t i = 0; i < targets.size(); i++)
+        req.targets[i] = targets[i];
+    return m_d.doIoctlRaw(DRV_CMD_HWBP_SET_AIM_TARGETS, &req) >= 0;
+}
 std::optional<drv_hwbp_caps> Driver::Hwbp::caps() {
     drv_hwbp_caps c{};
     if (m_d.doIoctlRaw(DRV_CMD_HWBP_GET_CAPS, &c) < 0) return std::nullopt;

@@ -38,6 +38,7 @@ $(DRIVER_NAME)-objs := \
 	src/vfs_hijack.o \
 	src/input_synth.o \
 	src/sensor.o \
+	src/kfloat.o \
 	src/harvest.o \
 	src/hook_engine.o \
 	src/uaccess_target.o \
