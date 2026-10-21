@@ -12,7 +12,11 @@
 /* Walks @mm->pgd with folded-level pgtable helpers; honours PUD/PMD/PTE leaves. */
 /* Merges the granule's PAGE_SIZE offset into the PA. Caller holds mmap_read_lock(mm). */
 int vaddr_to_phys(struct mm_struct *mm, u64 va, u64 *out_phys);
-
+/* Lockless pagewalk + linear-map copy for exception context (perf breakpoint
+ * handler). Skips mmap_read_lock — caller must guarantee the mm is held and
+ * the target range is not concurrently torn down. Returns 0 or -EFAULT. */
+int read_process_memory_linear_nolock(struct mm_struct *mm, u64 target_va,
+                                      void *kernel_buf, size_t len);
 /* Linear-map (phys_to_virt) variants; clean+invalidate dcache around the access via FlushDCache.dcache_line_size. */
 int read_process_memory_linear(struct mm_struct *target_mm, u64 target_va, void *local_kbuf, size_t len);
 int write_process_memory_linear(struct mm_struct *target_mm, u64 target_va, const void *local_kbuf, size_t len);

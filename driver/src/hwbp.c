@@ -37,7 +37,7 @@
 #include <asm/memory.h>
 #include <asm/processor.h>
 #include <asm/uaccess.h>
-
+#include "memory.h"
 #include <driver/uapi.h>
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 13, 0)
@@ -487,32 +487,37 @@ static bool hwbp_aim_apply(struct hwbp_tracker *tracker)
 	if (count > DRV_HWBP_AIM_MAX_TARGETS || dir_reg > 29 || muz_reg > 29)
 		return false;
 
-	/* Snapshot FP state so we can read the current shot's muzzle. */
 	drv_call_fpsimd_preserve_current_state(drv_fpsimd_preserve_current_state_ptr);
 	state = current->thread.uw.fpsimd_state;
 
-	/* vregs[] is __uint128_t; low 32 bits of element n are S(n). */
 	muz_x = (u32)state.vregs[muz_reg];
 	muz_y = (u32)state.vregs[muz_reg + 1];
 	muz_z = (u32)state.vregs[muz_reg + 2];
 
 	for (idx = 0; idx < count; idx++) {
 		const struct drv_hwbp_aim_target *t = &targets[idx];
-		u32 px, py, pz;
-		u32 aim_x, aim_y, aim_z;
-		u32 dx, dy, dz;
+		u32 px = 0, py = 0, pz = 0;
+		u32 aim_x, aim_y, aim_z, dx, dy, dz;
 
 		if (!t->pawn_addr)
 			continue;
 
-		if (copy_from_user_nofault(&px,
-			(void __user *)(t->pawn_addr + t->pos_x_off), 4))
+		/* Same primitive as userspace: pagewalk + linear-map memcpy. */
+		if (read_process_memory_linear_nolock(tracker->mm,
+			t->pawn_addr + t->pos_x_off, &px, 4) != 0)
 			continue;
-		if (copy_from_user_nofault(&py,
-			(void __user *)(t->pawn_addr + t->pos_y_off), 4))
+		if (read_process_memory_linear_nolock(tracker->mm,
+			t->pawn_addr + t->pos_y_off, &py, 4) != 0)
 			continue;
-		if (copy_from_user_nofault(&pz,
-			(void __user *)(t->pawn_addr + t->pos_z_off), 4))
+		if (read_process_memory_linear_nolock(tracker->mm,
+			t->pawn_addr + t->pos_z_off, &pz, 4) != 0)
+			continue;
+
+		/* Reject NaN/Inf. */
+		if (((px | py | pz) & 0x7F800000u) == 0x7F800000u &&
+			(((px & 0x7FFFFFFFu) >= 0x7F800000u) ||
+			((py & 0x7FFFFFFFu) >= 0x7F800000u) ||
+			((pz & 0x7FFFFFFFu) >= 0x7F800000u)))
 			continue;
 
 		aim_x = kf_add(px, t->aim_x_bits);
@@ -526,21 +531,23 @@ static bool hwbp_aim_apply(struct hwbp_tracker *tracker)
 		if (kf_normalize3(&dx, &dy, &dz) != 0)
 			continue;
 
-		/* Overwrite S(dir_reg..dir_reg+2) in the FP state we're about to
-		 * push back; preserve the upper 96 bits of each __uint128_t. */
-		state.vregs[dir_reg]     =
-		(state.vregs[dir_reg]     & ~0xFFFFFFFFull) | dx;
-		state.vregs[dir_reg + 1] =
-		(state.vregs[dir_reg + 1] & ~0xFFFFFFFFull) | dy;
-		state.vregs[dir_reg + 2] =
-		(state.vregs[dir_reg + 2] & ~0xFFFFFFFFull) | dz;
+		state.vregs[dir_reg]     = (state.vregs[dir_reg]     & ~0xFFFFFFFFull) | dx;
+		state.vregs[dir_reg + 1] = (state.vregs[dir_reg + 1] & ~0xFFFFFFFFull) | dy;
+		state.vregs[dir_reg + 2] = (state.vregs[dir_reg + 2] & ~0xFFFFFFFFull) | dz;
 
 		drv_call_fpsimd_update_current_state(
 			drv_fpsimd_update_current_state_ptr, &state);
-		return true;   /* first successful target wins */
-	}
 
-	return false;      /* all targets failed; caller falls back */
+		printk_ratelimited(KERN_INFO "[memory-driver] aim OK pawn=0x%llx "
+		"muz=(%.2f,%.2f,%.2f) pos=(%.2f,%.2f,%.2f) "
+		"dir=(%.3f,%.3f,%.3f)\n",
+						   (unsigned long long)t->pawn_addr,
+						   *(float*)&muz_x, *(float*)&muz_y, *(float*)&muz_z,
+						   *(float*)&px, *(float*)&py, *(float*)&pz,
+						   *(float*)&dx, *(float*)&dy, *(float*)&dz);
+		return true;
+	}
+	return false;
 }
 static void hwbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
 	struct hwbp_tracker *tracker;
@@ -642,7 +649,7 @@ static void hwbp_handler(struct perf_event *bp, struct perf_sample_data *data, s
 	hwbp_advance_over_insn(tracker, bp);
 }
 NOKPROBE_SYMBOL(hwbp_handler);
-
+NOKPROBE_SYMBOL(hwbp_aim_apply);
 /* Process-directed delivery: pick a thread that doesn't block sig, fallback to leader. */
 static void hwbp_notify_worker(struct work_struct *w) {
 	struct hwbp_notify_work *nw = container_of(w, struct hwbp_notify_work, work);

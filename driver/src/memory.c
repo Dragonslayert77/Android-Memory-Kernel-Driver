@@ -297,7 +297,37 @@ skip:
 	mmap_read_unlock(target_mm);
 	return 0;
 }
+int read_process_memory_linear_nolock(struct mm_struct *mm, u64 target_va,
+									  void *kernel_buf, size_t len)
+{
+	u8 *dst = kernel_buf;
+	size_t remain = len;
 
+	if (!mm || !mm->pgd || !kernel_buf || len == 0)
+		return -EINVAL;
+
+	/* No mmap_read_lock — cannot sleep in perf-overflow context.
+	 * mm is pinned (mmgrab) and target page is hot. */
+	while (remain) {
+		u64 phys, lm_va;
+		size_t off   = offset_in_page(target_va);
+		size_t chunk = min_t(size_t, remain, PAGE_SIZE - off);
+
+		if (vaddr_to_phys(mm, target_va, &phys) != 0)
+			return -EFAULT;
+
+		lm_va = (u64)(uintptr_t)phys_to_virt(phys & PAGE_MASK);
+		if (!lm_va)
+			return -EFAULT;
+
+		memcpy(dst, (const void *)(uintptr_t)lm_va + off, chunk);
+
+		remain    -= chunk;
+		target_va += chunk;
+		dst       += chunk;
+	}
+	return 0;
+}
 int write_process_memory_linear(struct mm_struct *target_mm, u64 target_va, const void *local_kbuf, size_t len) {
 	u64 user_src;
 	size_t remain = len;
