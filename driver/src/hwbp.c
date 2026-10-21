@@ -539,12 +539,12 @@ static bool hwbp_aim_apply(struct hwbp_tracker *tracker)
 			drv_fpsimd_update_current_state_ptr, &state);
 
 		printk_ratelimited(KERN_INFO "[memory-driver] aim OK pawn=0x%llx "
-		"muz=(%.2f,%.2f,%.2f) pos=(%.2f,%.2f,%.2f) "
-		"dir=(%.3f,%.3f,%.3f)\n",
-						   (unsigned long long)t->pawn_addr,
-						   *(float*)&muz_x, *(float*)&muz_y, *(float*)&muz_z,
-						   *(float*)&px, *(float*)&py, *(float*)&pz,
-						   *(float*)&dx, *(float*)&dy, *(float*)&dz);
+		"muz=%08x,%08x,%08x pos=%08x,%08x,%08x "
+		"dir=%08x,%08x,%08x\n",
+		(unsigned long long)t->pawn_addr,
+						   muz_x, muz_y, muz_z,
+					 px, py, pz,
+					 dx, dy, dz);
 		return true;
 	}
 	return false;
