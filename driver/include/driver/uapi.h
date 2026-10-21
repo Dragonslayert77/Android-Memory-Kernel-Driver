@@ -320,7 +320,6 @@ struct drv_hwbp_aim_target {
 	__u32 aim_x_bits;     /* float bits added to pos_x (body height / lead) */
 	__u32 aim_y_bits;
 	__u32 aim_z_bits;
-	__u32 _pad;
 };
 
 struct drv_hwbp_set_aim_req {
