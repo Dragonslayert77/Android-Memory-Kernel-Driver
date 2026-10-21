@@ -55,9 +55,9 @@ u32 kf_mul(u32 a, u32 b)
 
     if (prod & (1ull << 47)) {
         shift = 24;
+        exp += 1;
     } else {
         shift = 23;
-        exp -= 1;
     }
 
     mant      = (u32)(prod >> shift) & 0x7FFFFFu;
