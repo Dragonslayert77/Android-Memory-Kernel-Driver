@@ -538,13 +538,6 @@ static bool hwbp_aim_apply(struct hwbp_tracker *tracker)
 		drv_call_fpsimd_update_current_state(
 			drv_fpsimd_update_current_state_ptr, &state);
 
-		printk_ratelimited(KERN_INFO "[memory-driver] aim OK pawn=0x%llx "
-		"muz=%08x,%08x,%08x pos=%08x,%08x,%08x "
-		"dir=%08x,%08x,%08x\n",
-		(unsigned long long)t->pawn_addr,
-						   muz_x, muz_y, muz_z,
-					 px, py, pz,
-					 dx, dy, dz);
 		return true;
 	}
 	return false;
@@ -614,11 +607,6 @@ static void hwbp_handler(struct perf_event *bp, struct perf_sample_data *data, s
 		hwbp_ring_push(tracker, regs);
 		hwbp_maybe_notify(tracker);
 	}
-	count = hwbp_snapshot_overrides(tracker, overrides);
-	if (!timing_bypass) {
-		hwbp_ring_push(tracker, regs);
-		hwbp_maybe_notify(tracker);
-	}
 
 	/* NEW: silent-aim direction injection takes precedence over
 	 * userspace-pushed VLO overrides. */
@@ -629,9 +617,6 @@ static void hwbp_handler(struct perf_event *bp, struct perf_sample_data *data, s
 		if (!aim_ok && hwbp_has_fp_override(overrides, count))
 			hwbp_apply_fp(overrides, count);
 	}
-	hwbp_apply_gp(regs, overrides, count);
-	if (hwbp_has_fp_override(overrides, count))
-		hwbp_apply_fp(overrides, count);
 	hwbp_apply_gp(regs, overrides, count);
 
 	/* Watchpoint success is one-shot; client re-arms via install() on the same key. */
@@ -1133,15 +1118,17 @@ out_unlock:
 	return rc;
 }
 
-/* clearAll owned by this fd only; other fds' trackers are untouched. */
+
+/* Unconditionally wipe every tracker across every fd / process.
+ * Ignores @owner — use hwbp_clear_by_file() for fd-scoped cleanup. */
 static long hwbp_clear_all(struct file *owner) {
 	struct hwbp_tracker *tracker;
 	struct hwbp_tracker *next;
 
+	(void)owner;   /* global nuke — no owner filter */
+
 	mutex_lock(&hwbp_mutex);
 	list_for_each_entry_safe(tracker, next, &hwbp_trackers, node) {
-		if (owner && tracker->owner_file != owner)
-			continue;
 		list_del(&tracker->node);
 		hwbp_unregister_and_free(tracker);
 	}
