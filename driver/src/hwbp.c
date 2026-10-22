@@ -612,7 +612,9 @@ static void hwbp_handler(struct perf_event *bp, struct perf_sample_data *data, s
 	 * userspace-pushed VLO overrides. */
 	{
 		bool aim_ok = false;
-		if (tracker->aim_enabled && tracker->bp_type == DRV_HWBP_TYPE_X)
+		if (tracker->aim_enabled &&
+			tracker->bp_type == DRV_HWBP_TYPE_X &&
+			(tracker->flags & DRV_HWBP_FLAG_CAPTURE_FP))
 			aim_ok = hwbp_aim_apply(tracker);
 		if (!aim_ok && hwbp_has_fp_override(overrides, count))
 			hwbp_apply_fp(overrides, count);
@@ -1293,7 +1295,6 @@ static long hwbp_set_aim_targets(void __user *arg, struct file *owner)
 		return -EINVAL;
 	if (req.direction_reg > 29 || req.muzzle_reg > 29)
 		return -EINVAL;
-
 	if (hwbp_get_pid_ref((u64)req.pid, &pid_ref) != 0)
 		return -ESRCH;
 
@@ -1302,6 +1303,7 @@ static long hwbp_set_aim_targets(void __user *arg, struct file *owner)
 		if (tr->pid_ref != pid_ref) continue;
 		if (owner && tr->owner_file != owner) continue;
 		if (req.hwbp_addr != 0 && tr->addr != req.hwbp_addr) continue;
+		if (!(tr->flags & DRV_HWBP_FLAG_CAPTURE_FP)) continue;
 
 		spin_lock_irqsave(&tr->override_lock, flags);
 		tr->aim_enabled      = (req.enabled && req.count) ? 1u : 0u;
