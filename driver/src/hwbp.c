@@ -333,23 +333,40 @@ static void hwbp_apply_gp(struct pt_regs *regs, const struct drv_hwbp_reg_overri
 	}
 }
 
-static void hwbp_apply_fp(const struct drv_hwbp_reg_override *overrides, u32 count) {
+static void hwbp_apply_fp(const struct drv_hwbp_reg_override *overrides, u32 count)
+{
 	struct user_fpsimd_state state;
 	u64 *vregs;
-	u32 i;
+	u32 i, applied = 0;
 
 	if (!hwbp_fp_ready)
 		return;
+
 	drv_call_fpsimd_preserve_current_state(drv_fpsimd_preserve_current_state_ptr);
 	state = current->thread.uw.fpsimd_state;
 	vregs = (u64 *)&state.vregs[0];
+
 	for (i = 0; i < count; i++) {
-		if (overrides[i].kind == DRV_HWBP_REG_VLO)
-			vregs[2u * overrides[i].index] = overrides[i].value;
-		else if (overrides[i].kind == DRV_HWBP_REG_VHI)
+		if (overrides[i].kind == DRV_HWBP_REG_VLO) {
+			u64 old_val = vregs[2u * overrides[i].index];
+			u64 new_val = overrides[i].value;
+			// If the override is a 32-bit float, preserve the high 32 bits to avoid corrupting S1
+			if ((new_val & 0xFFFFFFFF00000000ULL) == 0) {
+				vregs[2u * overrides[i].index] = (old_val & 0xFFFFFFFF00000000ULL) | (new_val & 0xFFFFFFFFULL);
+			} else {
+				vregs[2u * overrides[i].index] = new_val;
+			}
+			applied++;
+		} else if (overrides[i].kind == DRV_HWBP_REG_VHI) {
 			vregs[2u * overrides[i].index + 1u] = overrides[i].value;
+			applied++;
+		}
 	}
-	drv_call_fpsimd_update_current_state(drv_fpsimd_update_current_state_ptr, &state);
+
+	// Write back to memory and force the kernel to safely reload on ret_to_user
+	current->thread.uw.fpsimd_state = state;
+	set_thread_flag(TIF_FOREIGN_FPSTATE);
+
 }
 
 static bool hwbp_has_fp_override(const struct drv_hwbp_reg_override *overrides, u32 count) {
@@ -463,12 +480,13 @@ static void hwbp_recover_after_skip(struct hwbp_tracker *tracker, struct perf_ev
 
 static bool hwbp_aim_apply(struct hwbp_tracker *tracker)
 {
-	struct drv_hwbp_aim_target targets[DRV_HWBP_AIM_MAX_TARGETS];
+	struct drv_hwbp_aim_target *targets;
 	struct user_fpsimd_state state;
 	unsigned long flags;
 	u32 count, dir_reg, muz_reg;
 	u32 muz_x, muz_y, muz_z;
 	u32 idx;
+	bool applied = false;
 
 	if (!hwbp_fp_ready)
 		return false;
@@ -481,11 +499,25 @@ static bool hwbp_aim_apply(struct hwbp_tracker *tracker)
 	count   = tracker->aim_count;
 	dir_reg = tracker->aim_direction_reg;
 	muz_reg = tracker->aim_muzzle_reg;
-	memcpy(targets, tracker->aim_targets, sizeof(targets));
 	spin_unlock_irqrestore(&tracker->override_lock, flags);
 
 	if (count > DRV_HWBP_AIM_MAX_TARGETS || dir_reg > 29 || muz_reg > 29)
 		return false;
+
+	/* Allocate dynamically to avoid blowing the 2KB stack limit */
+	targets = kmalloc_array(count, sizeof(*targets), GFP_ATOMIC);
+	if (!targets)
+		return false;
+
+	spin_lock_irqsave(&tracker->override_lock, flags);
+	/* Re-check under lock in case userspace changed targets */
+	if (!tracker->aim_enabled || tracker->aim_count != count) {
+		spin_unlock_irqrestore(&tracker->override_lock, flags);
+		kfree(targets);
+		return false;
+	}
+	memcpy(targets, tracker->aim_targets, count * sizeof(*targets));
+	spin_unlock_irqrestore(&tracker->override_lock, flags);
 
 	drv_call_fpsimd_preserve_current_state(drv_fpsimd_preserve_current_state_ptr);
 	state = current->thread.uw.fpsimd_state;
@@ -535,12 +567,15 @@ static bool hwbp_aim_apply(struct hwbp_tracker *tracker)
 		state.vregs[dir_reg + 1] = (state.vregs[dir_reg + 1] & ~0xFFFFFFFFull) | dy;
 		state.vregs[dir_reg + 2] = (state.vregs[dir_reg + 2] & ~0xFFFFFFFFull) | dz;
 
-		drv_call_fpsimd_update_current_state(
-			drv_fpsimd_update_current_state_ptr, &state);
+		current->thread.uw.fpsimd_state = state;
+		set_thread_flag(TIF_FOREIGN_FPSTATE);
 
-		return true;
+		applied = true;
+		break;
 	}
-	return false;
+
+	kfree(targets);
+	return applied;
 }
 static void hwbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
 	struct hwbp_tracker *tracker;
@@ -1281,42 +1316,59 @@ out:
 }
 static long hwbp_set_aim_targets(void __user *arg, struct file *owner)
 {
-	struct drv_hwbp_set_aim_req req;
+	struct drv_hwbp_set_aim_req *req;
 	struct hwbp_tracker *tr;
 	struct pid *pid_ref;
 	unsigned long flags;
 	int found = 0;
 
-	if (copy_from_user(&req, arg, sizeof(req)) != 0)
+	/* Allocate dynamically to avoid blowing the stack limit in do_hwbp_ext_cmd */
+	req = kmalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	if (copy_from_user(req, arg, sizeof(*req)) != 0) {
+		kfree(req);
 		return -EFAULT;
-	if (req.pid <= 0)
+	}
+
+	if (req->pid <= 0) {
+		kfree(req);
 		return -EINVAL;
-	if (req.count > DRV_HWBP_AIM_MAX_TARGETS)
+	}
+	if (req->count > DRV_HWBP_AIM_MAX_TARGETS) {
+		kfree(req);
 		return -EINVAL;
-	if (req.direction_reg > 29 || req.muzzle_reg > 29)
+	}
+	if (req->direction_reg > 29 || req->muzzle_reg > 29) {
+		kfree(req);
 		return -EINVAL;
-	if (hwbp_get_pid_ref((u64)req.pid, &pid_ref) != 0)
+	}
+	if (hwbp_get_pid_ref((u64)req->pid, &pid_ref) != 0) {
+		kfree(req);
 		return -ESRCH;
+	}
 
 	mutex_lock(&hwbp_mutex);
 	list_for_each_entry(tr, &hwbp_trackers, node) {
 		if (tr->pid_ref != pid_ref) continue;
 		if (owner && tr->owner_file != owner) continue;
-		if (req.hwbp_addr != 0 && tr->addr != req.hwbp_addr) continue;
+		if (req->hwbp_addr != 0 && tr->addr != req->hwbp_addr) continue;
 		if (!(tr->flags & DRV_HWBP_FLAG_CAPTURE_FP)) continue;
 
 		spin_lock_irqsave(&tr->override_lock, flags);
-		tr->aim_enabled      = (req.enabled && req.count) ? 1u : 0u;
-		tr->aim_count        = req.enabled ? req.count : 0u;
-		tr->aim_direction_reg = req.direction_reg;
-		tr->aim_muzzle_reg    = req.muzzle_reg;
-		memcpy(tr->aim_targets, req.targets, sizeof(tr->aim_targets));
+		tr->aim_enabled      = (req->enabled && req->count) ? 1u : 0u;
+		tr->aim_count        = req->enabled ? req->count : 0u;
+		tr->aim_direction_reg = req->direction_reg;
+		tr->aim_muzzle_reg    = req->muzzle_reg;
+		memcpy(tr->aim_targets, req->targets, sizeof(tr->aim_targets));
 		spin_unlock_irqrestore(&tr->override_lock, flags);
 		found++;
 	}
 	mutex_unlock(&hwbp_mutex);
 	put_pid(pid_ref);
 
+	kfree(req);
 	return found ? 0 : -ENOENT;
 }
 static long hwbp_set_notify(void __user *arg, struct file *owner) {
