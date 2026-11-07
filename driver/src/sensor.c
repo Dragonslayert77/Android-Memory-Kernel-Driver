@@ -183,8 +183,14 @@ static int drv_uprobe_register(struct inode *inode, loff_t offset,
 
 /* ---------------- handler ---------------- */
 
-int handler_pre(struct uprobe_consumer *self, struct pt_regs *regs)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+int handler_pre(struct uprobe_consumer *self, struct pt_regs *regs, __u64 *data)
 {
+	(void)data; /* Unused in this handler */
+	#else
+	int handler_pre(struct uprobe_consumer *self, struct pt_regs *regs)
+	{
+		#endif
 	struct sensor_slot *slot = container_of(self, struct sensor_slot, uc);
 	const struct sensor_abi_layout *layout;
 	unsigned long user_ptr;

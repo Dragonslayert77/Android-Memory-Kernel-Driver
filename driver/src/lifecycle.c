@@ -35,7 +35,7 @@
 #include "module_hide.h"
 #include "stealth.h"
 #include "user_hook.h"
-
+#include <linux/version.h>
 struct drv_state drv;
 
 #if KCFG_HIDE_SELF_MODULE
@@ -190,4 +190,8 @@ module_init(init_driver);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Anonymous");
 MODULE_DESCRIPTION("Android kernel driver");
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
+#else
 MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+#endif

@@ -17,8 +17,8 @@ on:
       ddk_release:
         description: 'ghcr.io/ylarod/ddk image tag suffix (release date)'
         required: false
-        # android16-6.12 requires normalized KCFI type IDs. 20251104 is the first DDK release that configures them correctly.
-        default: '20251104'
+        # android16-6.12 requires normalized KCFI type IDs. 20260828 is the first DDK release that configures them correctly.
+        default: '20260828'
         type: string
       hide_kgsl_strength:
         description: 'HIDE_KGSL_STRENGTH override (0..3). Empty = default (0).'
@@ -79,9 +79,10 @@ jobs:
           - android14-6.1
           - android15-6.6
           - android16-6.12
+          - android17-6.18
 
     container:
-      image: ghcr.io/ylarod/ddk:${{ matrix.kmi }}-${{ inputs.ddk_release || '20251104' }}
+      image: ghcr.io/ylarod/ddk:${{ matrix.kmi }}-${{ inputs.ddk_release || '20260828' }}
       options: --privileged
 
     env:
@@ -99,7 +100,7 @@ jobs:
         working-directory: driver
         run: |
           echo "=== KMI:           ${{ matrix.kmi }}"
-          echo "=== DDK image tag: ${{ matrix.kmi }}-${{ inputs.ddk_release || '20251104' }}"
+          echo "=== DDK image tag: ${{ matrix.kmi }}-${{ inputs.ddk_release || '20260828' }}"
           echo "=== KERNEL_SRC:    $KERNEL_SRC"
           echo "=== DRIVER_NAME:   $DRIVER_NAME"
           echo "=== HIDE_SELF_MODULE:   $HIDE_SELF_MODULE"
@@ -112,16 +113,25 @@ jobs:
 
       # Android 16 / 6.12 enables strict KCFI. A module built without integer
       # normalization can panic before module_init() executes.
-      - name: Verify Android 16 / 6.12 KCFI configuration
-        if: matrix.kmi == 'android16-6.12'
+      - name: Verify KCFI configuration
         working-directory: driver
         run: |
           set -eux
           config="${KERNEL_SRC}/.config"
           test -r "$config"
-          grep -Fxq 'CONFIG_CFI_CLANG=y' "$config"
-          grep -Fxq 'CONFIG_CFI_ICALL_NORMALIZE_INTEGERS=y' "$config"
 
+          if [ "${{ matrix.kmi }}" = "android17-6.18" ]; then
+            # 6.18+ renamed CONFIG_CFI_CLANG to CONFIG_CFI
+            grep -Fxq 'CONFIG_CFI=y' "$config"
+            grep -Fxq 'CONFIG_CFI_ICALL_NORMALIZE_INTEGERS=y' "$config" || \
+              grep -Fxq 'CONFIG_CFI_ICALL_NORMALIZE_INTEGERS_CLANG=y' "$config"
+          elif [ "${{ matrix.kmi }}" = "android16-6.12" ]; then
+            grep -Fxq 'CONFIG_CFI_CLANG=y' "$config"
+            grep -Fxq 'CONFIG_CFI_ICALL_NORMALIZE_INTEGERS=y' "$config"
+          else
+            # Older kernels (5.10, 5.15, 6.1, 6.6) may not have the normalize integers option
+            grep -Fxq 'CONFIG_CFI_CLANG=y' "$config" || true
+          fi
       - name: Build ${{ env.DRIVER_NAME }}.ko
         working-directory: driver
         run: |
@@ -146,14 +156,13 @@ jobs:
 
       # Confirm that the normalized KCFI setting reached the external-module
       # compiler command rather than merely existing in the kernel .config.
-      - name: Verify Android 16 / 6.12 KCFI compiler flags
-        if: matrix.kmi == 'android16-6.12'
+      - name: Verify KCFI compiler flags
+        if: contains(fromJSON('["android16-6.12", "android17-6.18"]'), matrix.kmi)
         working-directory: driver
         run: |
           set -eux
           grep -R -F -q --include='*.cmd' -- \
             '-fsanitize-cfi-icall-experimental-normalize-integers' .
-
       - name: Stage artefact (rename per-KMI)
         working-directory: driver
         run: |
